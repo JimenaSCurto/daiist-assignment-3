@@ -1,12 +1,643 @@
 """
-Assignment 3: build the index (`main.py index`). May be index.ipynb instead.
+Assignment 3: build the index (`main.py index`).
 
-Download the corpus (into corpus/, git-ignored), extract, clean and chunk it
-with source and location metadata, embed with Gemini, and store everything in
-index/. Save each vector as you get it and embed only chunks without one.
+Corpus: the complete Congreso trail of Proyecto de Ley Orgánica 121/000001,
+"de representación paritaria y presencia equilibrada de mujeres y hombres",
+whose Artículo primero amends the LOREG (LO 5/1985) and therefore governs the
+candidate lists for the May 2027 elections.
 
-Write the per-file steps as functions (e.g. `chunk_file(path)`,
-`embed_and_store(chunks)`): server.py's add-document tool imports them.
+Documents are downloaded into corpus/ (git-ignored), extracted with pypdf,
+cleaned, chunked with source + location metadata, embedded with Gemini and
+stored in index/. Vectors are cached on the SHA-256 of the chunk text, so
+re-chunking never re-embeds an identical chunk and a crash costs nothing.
+
+    uv run python main.py index            # full build (downloads, chunks, embeds)
+    uv run python index.py --dry-run       # chunk and report only; no API calls
+
+server.py imports chunk_file(), embed_and_store() and document_status().
 """
 
-raise NotImplementedError("Write your index stage.")
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import sys
+import unicodedata
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import httpx
+import numpy as np
+from pypdf import PdfReader
+
+ROOT = Path(__file__).resolve().parent
+CORPUS_DIR = ROOT / "corpus"
+INDEX_DIR = ROOT / "index"
+CHROMA_DIR = INDEX_DIR / "chroma"
+VECTORS_PATH = INDEX_DIR / "vectors.npy"
+VECTOR_KEYS_PATH = INDEX_DIR / "vector_keys.json"
+CHUNKS_PATH = INDEX_DIR / "chunks.jsonl"
+MANIFEST_PATH = INDEX_DIR / "manifest.json"
+
+# A descriptive User-Agent is required: congreso.es answers 403 to a bare client.
+USER_AGENT = "daiist-assignment3-indexer/1.0 (university coursework; public parliamentary documents)"
+BASE_URL = "https://www.congreso.es/public_oficiales/L15/CONG"
+
+# SETUP.md names this model and its ~1,000-texts-a-day free tier.
+EMBED_MODEL = "gemini-embedding-2"
+EMBED_DIM = 768  # reduced from the default to keep index/ far below the 90 MB cap
+EMBED_BATCH = 16
+
+STRATEGIES = ("fixed_200", "structured")
+DEFAULT_STRATEGY = "structured"
+
+FIXED_SIZE, FIXED_OVERLAP = 200, 40
+MAX_STRUCTURED_WORDS, STRUCTURED_OVERLAP = 400, 60
+
+
+# --------------------------------------------------------------------------
+# Corpus registry
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Source:
+    doc_id: str
+    titulo: str
+    tramite: str
+    genero: str                 # norma | enmiendas | debate
+    path_fragment: str
+    pages: tuple[tuple[int, int], ...] | None = None   # 1-indexed inclusive ranges
+    held_back: bool = False     # excluded from the built index, for the add_document demo
+
+    @property
+    def url(self) -> str:
+        return f"{BASE_URL}/{self.path_fragment}"
+
+    @property
+    def local_path(self) -> Path:
+        return CORPUS_DIR / f"{self.doc_id}.PDF"
+
+
+SOURCES: tuple[Source, ...] = (
+    Source(
+        "BOCG-15-A-1-1",
+        "Proyecto de Ley Orgánica de representación paritaria y presencia equilibrada de mujeres y hombres",
+        "proyecto", "norma", "BOCG/A/BOCG-15-A-1-1.PDF",
+    ),
+    Source(
+        "BOCG-15-A-1-4",
+        "Informe de la Ponencia",
+        "informe_ponencia", "norma", "BOCG/A/BOCG-15-A-1-4.PDF",
+    ),
+    Source(
+        "BOCG-15-A-1-8",
+        "Aprobación definitiva por el Congreso de los Diputados",
+        "aprobacion_definitiva", "norma", "BOCG/A/BOCG-15-A-1-8.PDF",
+    ),
+    Source(
+        "DSCD-15-PL-54",
+        "Debate y aprobación por el Pleno, sesión de 27 de junio de 2024",
+        "debate_pleno", "debate", "DS/PL/DSCD-15-PL-54.PDF",
+        # The session covers several agenda items. Pages 4-20 are this bill's
+        # debate and 32-39 the votaciones, per the document's own orden del día.
+        pages=((4, 20), (32, 39)),
+    ),
+    Source(
+        "BOCG-15-A-1-2",
+        "Enmiendas e índice de enmiendas al articulado",
+        "enmiendas", "enmiendas", "BOCG/A/BOCG-15-A-1-2.PDF",
+        held_back=True,
+    ),
+)
+
+BY_DOC_ID = {s.doc_id: s for s in SOURCES}
+
+
+# --------------------------------------------------------------------------
+# Fetching
+# --------------------------------------------------------------------------
+
+def fetch(source: Source, force: bool = False) -> Path:
+    """Download a document into corpus/, unless a valid copy is already there."""
+    destination = source.local_path
+    CORPUS_DIR.mkdir(parents=True, exist_ok=True)
+    if destination.is_file() and not force and destination.read_bytes()[:4] == b"%PDF":
+        return destination
+    response = httpx.get(
+        source.url,
+        headers={"User-Agent": USER_AGENT},
+        follow_redirects=True,
+        timeout=60.0,
+    )
+    response.raise_for_status()
+    if response.content[:4] != b"%PDF":
+        raise RuntimeError(f"{source.url} did not return a PDF (got {response.headers.get('content-type')!r})")
+    destination.write_bytes(response.content)
+    return destination
+
+
+# --------------------------------------------------------------------------
+# Extraction and cleaning
+# --------------------------------------------------------------------------
+
+HEADER_PREFIXES = (
+    "BOLETÍN OFICIAL DE LAS CORTES GENERALES",
+    "CONGRESO DE LOS DIPUTADOS",
+    "DIARIO DE SESIONES DEL CONGRESO DE LOS DIPUTADOS",
+    "PLENO Y DIPUTACIÓN PERMANENTE",
+    "CORTES GENERALES",
+)
+# "Serie A Núm. 1-8 31 de julio de 2024 Pág. 3" / "Núm. 54 27 de junio de 2024 Pág. 5"
+RUNNING_HEAD = re.compile(
+    r"^(?:Serie\s+\w+\s+)?Núm\.\s*[\w-]+\s+(?P<fecha>\d{1,2}\s+de\s+\w+\s+de\s+\d{4})\s+Pág\.\s*\d+\s*$"
+)
+CVE_LINE = re.compile(r"^cve:\s*(?P<cve>[\w-]+)\s*$", re.IGNORECASE)
+HYPHEN_BREAK = re.compile(r"(\w)-\s*\n\s*(\w)")
+
+MESES = {
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
+    "julio": 7, "agosto": 8, "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12,
+}
+
+
+def _iso_date(spanish: str) -> str | None:
+    match = re.match(r"(\d{1,2})\s+de\s+(\w+)\s+de\s+(\d{4})", spanish.strip(), re.IGNORECASE)
+    if not match:
+        return None
+    day, month_name, year = match.groups()
+    month = MESES.get(month_name.lower())
+    return f"{year}-{month:02d}-{int(day):02d}" if month else None
+
+
+@dataclass
+class Page:
+    number: int
+    paragraphs: list[str]
+
+
+@dataclass
+class Document:
+    doc_id: str
+    titulo: str
+    tramite: str
+    genero: str
+    url: str
+    fecha: str
+    cve: str
+    pages: list[Page]
+    content_sha256: str = ""
+
+    @property
+    def words(self) -> int:
+        return sum(len(p.split()) for page in self.pages for p in page.paragraphs)
+
+
+def _wanted(page_number: int, ranges: tuple[tuple[int, int], ...] | None) -> bool:
+    return ranges is None or any(low <= page_number <= high for low, high in ranges)
+
+
+def clean_page(raw: str) -> tuple[list[str], str | None, str | None]:
+    """Return (paragraphs, fecha, cve) for one page.
+
+    Strips the running header and the CVE stamp, repairs hyphenated line breaks
+    and joins soft-wrapped lines back into paragraphs. The date and the CVE are
+    captured before being discarded: both become chunk metadata, and the CVE is
+    what lets a reader verify a citation against the signed original.
+    """
+    raw = HYPHEN_BREAK.sub(r"\1\2", raw)
+    fecha = cve = None
+    kept: list[str] = []
+
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            kept.append("")
+            continue
+        if any(stripped.startswith(prefix) for prefix in HEADER_PREFIXES):
+            continue
+        head = RUNNING_HEAD.match(stripped)
+        if head:
+            fecha = fecha or _iso_date(head.group("fecha"))
+            continue
+        stamp = CVE_LINE.match(stripped)
+        if stamp:
+            cve = cve or stamp.group("cve")
+            continue
+        kept.append(stripped)
+
+    # Join soft wraps: a line that does not end a sentence continues the next one.
+    paragraphs: list[str] = []
+    buffer = ""
+    for line in kept:
+        if not line:
+            if buffer:
+                paragraphs.append(buffer.strip())
+                buffer = ""
+            continue
+        buffer = f"{buffer} {line}".strip() if buffer else line
+        if re.search(r"[.:;!?»]$", line):
+            paragraphs.append(buffer.strip())
+            buffer = ""
+    if buffer:
+        paragraphs.append(buffer.strip())
+
+    return [p for p in paragraphs if p], fecha, cve
+
+
+def load_document(source: Source, path: Path | None = None) -> Document:
+    """Extract, clean and page-filter one source into a Document."""
+    pdf_path = path or source.local_path
+    reader = PdfReader(str(pdf_path))
+    pages: list[Page] = []
+    fecha = cve = None
+
+    for position, page in enumerate(reader.pages, start=1):
+        paragraphs, page_fecha, page_cve = clean_page(page.extract_text() or "")
+        fecha = fecha or page_fecha
+        cve = cve or page_cve
+        if _wanted(position, source.pages) and paragraphs:
+            pages.append(Page(position, paragraphs))
+
+    document = Document(
+        doc_id=source.doc_id,
+        titulo=source.titulo,
+        tramite=source.tramite,
+        genero=source.genero,
+        url=source.url,
+        fecha=fecha or "",
+        cve=cve or source.doc_id,
+        pages=pages,
+    )
+    body = "\n".join(p for page in pages for p in page.paragraphs)
+    document.content_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    return document
+
+
+# --------------------------------------------------------------------------
+# Chunking
+# --------------------------------------------------------------------------
+
+ORDINALES = (
+    "primero|segundo|tercero|cuarto|quinto|sexto|séptimo|septimo|octavo|noveno|décimo|decimo|"
+    "undécimo|undecimo|duodécimo|duodecimo|decimotercero|decimocuarto|decimoquinto|decimosexto|"
+    "decimoséptimo|decimoseptimo|decimoctavo|decimonoveno|vigésimo|vigesimo|único|unico"
+)
+# The enacted text names articles with Spanish ordinals, not digits:
+# "Artículo primero", not "Artículo 1". A ^Artículo \d regex matches nothing.
+ARTICULO = re.compile(rf"^(Artículo\s+(?:{ORDINALES}|\d+)\b.*)", re.IGNORECASE)
+DISPOSICION = re.compile(
+    r"^(Disposición\s+(?:adicional|transitoria|derogatoria|final)\b.*)", re.IGNORECASE
+)
+PREAMBULO = re.compile(r"^(PREÁMBULO|EXPOSICIÓN DE MOTIVOS|ÍNDICE)\s*$", re.IGNORECASE)
+ENMIENDA = re.compile(r"^(ENMIENDA\s+NÚM\.\s*\d+)", re.IGNORECASE)
+INTERVENCION = re.compile(r"^((?:El señor|La señora)\s+[A-ZÁÉÍÓÚÑÜ][^:]{0,80}):")
+
+
+@dataclass
+class Chunk:
+    text: str
+    metadata: dict = field(default_factory=dict)
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.text.encode("utf-8")).hexdigest()
+
+    @property
+    def chunk_id(self) -> str:
+        return f"{self.metadata['doc_id']}:{self.metadata['chunk_strategy']}:{self.metadata['ordinal']:04d}"
+
+
+def _heading(paragraph: str, genero: str) -> str | None:
+    """The structural label this paragraph starts, if it starts one."""
+    if genero == "norma":
+        for pattern in (ARTICULO, DISPOSICION, PREAMBULO):
+            match = pattern.match(paragraph)
+            if match:
+                return re.sub(r"\s+", " ", match.group(1))[:90].rstrip(". ")
+    elif genero == "enmiendas":
+        match = ENMIENDA.match(paragraph)
+        if match:
+            return match.group(1).upper()
+    elif genero == "debate":
+        match = INTERVENCION.match(paragraph)
+        if match:
+            return re.sub(r"\s+", " ", match.group(1))[:90]
+    return None
+
+
+def _base_metadata(document: Document, strategy: str) -> dict:
+    return {
+        "doc_id": document.doc_id,
+        "titulo": document.titulo,
+        "tramite": document.tramite,
+        "genero": document.genero,
+        "fecha": document.fecha,
+        "cve": document.cve,
+        "url": document.url,
+        "expediente": "121/000001",
+        "chunk_strategy": strategy,
+    }
+
+
+def _split_long(words: list[str], limit: int, overlap: int) -> list[list[str]]:
+    if len(words) <= limit:
+        return [words]
+    pieces, start = [], 0
+    while start < len(words):
+        pieces.append(words[start:start + limit])
+        if start + limit >= len(words):
+            break
+        start += limit - overlap
+    return pieces
+
+
+def chunk_fixed(document: Document, size: int = FIXED_SIZE, overlap: int = FIXED_OVERLAP) -> list[Chunk]:
+    """Baseline: fixed-width word windows that ignore structure entirely."""
+    words: list[tuple[str, int]] = [
+        (word, page.number)
+        for page in document.pages
+        for paragraph in page.paragraphs
+        for word in paragraph.split()
+    ]
+    chunks: list[Chunk] = []
+    start = 0
+    while start < len(words):
+        window = words[start:start + size]
+        if not window:
+            break
+        page_from, page_to = window[0][1], window[-1][1]
+        metadata = _base_metadata(document, "fixed_200") | {
+            "ordinal": len(chunks),
+            "page": page_from,
+            "page_to": page_to,
+            "seccion": "",
+            "interviniente": "",
+            "location_label": f"{document.doc_id} · p. {page_from}"
+            + (f"-{page_to}" if page_to != page_from else ""),
+        }
+        chunks.append(Chunk(" ".join(w for w, _ in window), metadata))
+        if start + size >= len(words):
+            break
+        start += size - overlap
+    return chunks
+
+
+def chunk_structured(document: Document) -> list[Chunk]:
+    """Structure-aware: one chunk per artículo, per enmienda, or per speaker turn."""
+    units: list[tuple[str, int, list[str]]] = []   # (heading, first page, paragraphs)
+    heading, page_of_unit, buffer = "", None, []
+
+    for page in document.pages:
+        for paragraph in page.paragraphs:
+            found = _heading(paragraph, document.genero)
+            if found:
+                if buffer:
+                    units.append((heading, page_of_unit or page.number, buffer))
+                heading, page_of_unit, buffer = found, page.number, [paragraph]
+            else:
+                if page_of_unit is None:
+                    page_of_unit = page.number
+                buffer.append(paragraph)
+    if buffer:
+        units.append((heading, page_of_unit or 1, buffer))
+
+    chunks: list[Chunk] = []
+    for unit_heading, page_number, paragraphs in units:
+        words = " ".join(paragraphs).split()
+        if not words:
+            continue
+        for part, piece in enumerate(_split_long(words, MAX_STRUCTURED_WORDS, STRUCTURED_OVERLAP)):
+            label = unit_heading or "preámbulo"
+            suffix = f" ({part + 1})" if part else ""
+            interviniente = unit_heading if document.genero == "debate" else ""
+            metadata = _base_metadata(document, "structured") | {
+                "ordinal": len(chunks),
+                "page": page_number,
+                "page_to": page_number,
+                "seccion": label,
+                "interviniente": interviniente,
+                "location_label": f"{document.doc_id} · {label}{suffix} · p. {page_number}",
+            }
+            chunks.append(Chunk(" ".join(piece), metadata))
+    return chunks
+
+
+def chunk_document(document: Document, strategy: str) -> list[Chunk]:
+    return chunk_fixed(document) if strategy == "fixed_200" else chunk_structured(document)
+
+
+def infer_source(path: Path) -> Source:
+    """Identify a PDF that is not in the registry, from its own CVE stamp and heading.
+
+    Every BOCG and DS page carries `cve: <doc-id>`, so the document names itself.
+    """
+    reader = PdfReader(str(path))
+    first = reader.pages[0].extract_text() or ""
+    _, _, cve = clean_page(first)
+    doc_id = cve or path.stem.upper()
+    if doc_id in BY_DOC_ID:
+        return BY_DOC_ID[doc_id]
+
+    upper = first.upper()
+    if "DIARIO DE SESIONES" in upper:
+        genero, tramite = "debate", "debate"
+    elif "ENMIENDA" in upper:
+        genero, tramite = "enmiendas", "enmiendas"
+    else:
+        genero, tramite = "norma", "otro"
+    fragment = ("DS/PL/" if genero == "debate" else "BOCG/A/") + f"{doc_id}.PDF"
+    return Source(doc_id, f"Documento añadido: {doc_id}", tramite, genero, fragment)
+
+
+def chunk_file(path: str | Path, strategy: str = DEFAULT_STRATEGY) -> list[Chunk]:
+    """Public pipeline entry point. server.py's add_document calls this."""
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"No such file: {path}")
+    source = BY_DOC_ID.get(path.stem.upper()) or infer_source(path)
+    document = load_document(source, path=path)
+    return chunk_document(document, strategy)
+
+
+# --------------------------------------------------------------------------
+# Embedding, with a cache keyed on the chunk text
+# --------------------------------------------------------------------------
+
+def _load_vector_cache() -> dict[str, np.ndarray]:
+    if not (VECTORS_PATH.is_file() and VECTOR_KEYS_PATH.is_file()):
+        return {}
+    keys = json.loads(VECTOR_KEYS_PATH.read_text(encoding="utf-8"))
+    matrix = np.load(VECTORS_PATH)
+    return {key: matrix[row] for row, key in enumerate(keys)}
+
+
+def _save_vector_cache(cache: dict[str, np.ndarray]) -> None:
+    INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    keys = list(cache)
+    matrix = np.vstack([cache[key] for key in keys]).astype(np.float32) if keys else np.zeros((0, EMBED_DIM), np.float32)
+    np.save(VECTORS_PATH, matrix)
+    VECTOR_KEYS_PATH.write_text(json.dumps(keys), encoding="utf-8")
+
+
+def _embed_batch(texts: list[str], task_type: str) -> list[np.ndarray]:
+    from google import genai
+    from google.genai import types
+
+    from api_key import load_api_key
+
+    client = genai.Client(api_key=load_api_key())
+    response = client.models.embed_content(
+        model=EMBED_MODEL,
+        contents=texts,
+        config=types.EmbedContentConfig(task_type=task_type, output_dimensionality=EMBED_DIM),
+    )
+    vectors = []
+    for embedding in response.embeddings:
+        vector = np.asarray(embedding.values, dtype=np.float32)
+        norm = np.linalg.norm(vector)
+        vectors.append(vector / norm if norm else vector)   # reduced dimensions need normalising
+    return vectors
+
+
+def embed_texts(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT", log=print) -> list[np.ndarray]:
+    """Embed texts, reusing any vector already cached for identical text."""
+    cache = _load_vector_cache()
+    wanted = {hashlib.sha256(t.encode("utf-8")).hexdigest(): t for t in texts}
+    missing = [(key, text) for key, text in wanted.items() if key not in cache]
+    if missing:
+        log(f"  embedding {len(missing)} new texts ({len(wanted) - len(missing)} already cached)")
+        for start in range(0, len(missing), EMBED_BATCH):
+            batch = missing[start:start + EMBED_BATCH]
+            for key, vector in zip((k for k, _ in batch), _embed_batch([t for _, t in batch], task_type)):
+                cache[key] = vector
+            _save_vector_cache(cache)   # save as we go: a crash or the daily cap loses nothing
+            log(f"    {min(start + EMBED_BATCH, len(missing))}/{len(missing)}")
+    return [cache[hashlib.sha256(t.encode("utf-8")).hexdigest()] for t in texts]
+
+
+def _collection(strategy: str):
+    import chromadb
+
+    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    return client.get_or_create_collection(name=strategy, metadata={"hnsw:space": "cosine"})
+
+
+def document_status(doc_id: str, content_sha256: str, strategy: str = DEFAULT_STRATEGY) -> str:
+    """'new', 'identical' or 'revised' — the add_document duplicate policy."""
+    try:
+        existing = _collection(strategy).get(where={"doc_id": doc_id}, include=["metadatas"])
+    except Exception:
+        return "new"
+    metadatas = existing.get("metadatas") or []
+    if not metadatas:
+        return "new"
+    hashes = {m.get("content_sha256") for m in metadatas}
+    return "identical" if content_sha256 in hashes else "revised"
+
+
+def embed_and_store(chunks: list[Chunk], strategy: str = DEFAULT_STRATEGY, log=print) -> dict:
+    """Embed any chunk without a cached vector and upsert everything into Chroma."""
+    if not chunks:
+        return {"chunks": 0, "embedded": 0}
+    before = len(_load_vector_cache())
+    vectors = embed_texts([c.text for c in chunks], "RETRIEVAL_DOCUMENT", log=log)
+    after = len(_load_vector_cache())
+
+    collection = _collection(strategy)
+    collection.upsert(
+        ids=[c.chunk_id for c in chunks],
+        embeddings=[v.tolist() for v in vectors],
+        documents=[c.text for c in chunks],
+        metadatas=[c.metadata for c in chunks],
+    )
+    return {"chunks": len(chunks), "embedded": max(after - before, 0), "strategy": strategy}
+
+
+# --------------------------------------------------------------------------
+# Build
+# --------------------------------------------------------------------------
+
+def build(dry_run: bool = False, strategies: tuple[str, ...] = STRATEGIES) -> dict:
+    INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    active = [s for s in SOURCES if not s.held_back]
+
+    print(f"Corpus: {len(active)} documents (expediente 121/000001)\n")
+    documents: list[Document] = []
+    for source in active:
+        path = fetch(source)
+        document = load_document(source)
+        documents.append(document)
+        print(f"  {document.doc_id:<16} {document.words:>7,} words  {len(document.pages):>3} pages  {document.fecha}  [{document.tramite}]")
+    total_words = sum(d.words for d in documents)
+    print(f"\n  total: {total_words:,} words\n")
+
+    manifest: dict = {
+        "expediente": "121/000001",
+        "embed_model": EMBED_MODEL,
+        "embed_dim": EMBED_DIM,
+        "total_words": total_words,
+        "licence": "congreso.es aviso legal: reuse permitted if content is unaltered, its sense "
+                   "is not distorted, the source is cited and the last update date is given.",
+        "documents": [
+            {
+                "doc_id": d.doc_id, "titulo": d.titulo, "tramite": d.tramite, "genero": d.genero,
+                "fecha": d.fecha, "cve": d.cve, "url": d.url, "words": d.words,
+                "content_sha256": d.content_sha256,
+            }
+            for d in documents
+        ],
+        "held_back": [
+            {"doc_id": s.doc_id, "titulo": s.titulo, "url": s.url, "why": "reserved for the add_document demo"}
+            for s in SOURCES if s.held_back
+        ],
+        "strategies": {},
+    }
+
+    all_chunks: list[Chunk] = []
+    for strategy in strategies:
+        chunks = [c for d in documents for c in chunk_document(d, strategy)]
+        for chunk in chunks:
+            chunk.metadata["content_sha256"] = next(
+                d.content_sha256 for d in documents if d.doc_id == chunk.metadata["doc_id"]
+            )
+        lengths = [len(c.text.split()) for c in chunks]
+        manifest["strategies"][strategy] = {
+            "chunks": len(chunks),
+            "mean_words": round(sum(lengths) / len(lengths), 1) if lengths else 0,
+            "max_words": max(lengths, default=0),
+        }
+        print(f"  {strategy:<12} {len(chunks):>4} chunks   mean {manifest['strategies'][strategy]['mean_words']:>5} words   max {manifest['strategies'][strategy]['max_words']}")
+        all_chunks.extend(chunks)
+
+        if not dry_run:
+            result = embed_and_store(chunks, strategy)
+            print(f"  {strategy:<12} stored {result['chunks']} chunks, {result['embedded']} new embeddings")
+
+    with CHUNKS_PATH.open("w", encoding="utf-8") as handle:
+        for chunk in all_chunks:
+            handle.write(json.dumps({"id": chunk.chunk_id, "text": chunk.text, **chunk.metadata}, ensure_ascii=False) + "\n")
+    MANIFEST_PATH.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    budget = sum(v["chunks"] for v in manifest["strategies"].values())
+    print(f"\n  {budget} chunks in total -> at most {budget} embeddings for a cold build "
+          f"(free tier is ~1,000/day)")
+    if dry_run:
+        print("  dry run: nothing embedded, no API calls made")
+    return manifest
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Build the index.")
+    parser.add_argument("--dry-run", action="store_true", help="chunk and report only; no API calls")
+    parser.add_argument("--strategy", choices=STRATEGIES, help="build only one strategy")
+    args = parser.parse_args()
+    strategies = (args.strategy,) if args.strategy else STRATEGIES
+    build(dry_run=args.dry_run, strategies=strategies)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

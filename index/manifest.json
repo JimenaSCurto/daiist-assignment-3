@@ -1,0 +1,73 @@
+{
+  "expediente": "121/000001",
+  "embed_model": "gemini-embedding-2",
+  "embed_dim": 768,
+  "total_words": 63467,
+  "licence": "congreso.es aviso legal: reuse permitted if content is unaltered, its sense is not distorted, the source is cited and the last update date is given.",
+  "documents": [
+    {
+      "doc_id": "BOCG-15-A-1-1",
+      "titulo": "Proyecto de Ley Orgánica de representación paritaria y presencia equilibrada de mujeres y hombres",
+      "tramite": "proyecto",
+      "genero": "norma",
+      "fecha": "2023-12-15",
+      "cve": "BOCG-15-A-1-1",
+      "url": "https://www.congreso.es/public_oficiales/L15/CONG/BOCG/A/BOCG-15-A-1-1.PDF",
+      "words": 12464,
+      "content_sha256": "56507632def85a122927c4bc71b6b019fafb0da82a630f91f7249235bffb47de"
+    },
+    {
+      "doc_id": "BOCG-15-A-1-4",
+      "titulo": "Informe de la Ponencia",
+      "tramite": "informe_ponencia",
+      "genero": "norma",
+      "fecha": "2024-06-25",
+      "cve": "BOCG-15-A-1-4",
+      "url": "https://www.congreso.es/public_oficiales/L15/CONG/BOCG/A/BOCG-15-A-1-4.PDF",
+      "words": 14841,
+      "content_sha256": "6a889f240fd591f9b8d0b48efd6471f9cfe4c382fa3d4995578552e165d709d6"
+    },
+    {
+      "doc_id": "BOCG-15-A-1-8",
+      "titulo": "Aprobación definitiva por el Congreso de los Diputados",
+      "tramite": "aprobacion_definitiva",
+      "genero": "norma",
+      "fecha": "2024-07-31",
+      "cve": "BOCG-15-A-1-8",
+      "url": "https://www.congreso.es/public_oficiales/L15/CONG/BOCG/A/BOCG-15-A-1-8.PDF",
+      "words": 19274,
+      "content_sha256": "5d2bd240461e9257e3f630e3268db880f293b753072181334d42467bdbb49bb0"
+    },
+    {
+      "doc_id": "DSCD-15-PL-54",
+      "titulo": "Debate y aprobación por el Pleno, sesión de 27 de junio de 2024",
+      "tramite": "debate_pleno",
+      "genero": "debate",
+      "fecha": "2024-06-27",
+      "cve": "DSCD-15-PL-54",
+      "url": "https://www.congreso.es/public_oficiales/L15/CONG/DS/PL/DSCD-15-PL-54.PDF",
+      "words": 16888,
+      "content_sha256": "27818d200c83f164360e0b3cf618a9edae1fbcb2e71e53e6a26b9b0e172aeecd"
+    }
+  ],
+  "held_back": [
+    {
+      "doc_id": "BOCG-15-A-1-2",
+      "titulo": "Enmiendas e índice de enmiendas al articulado",
+      "url": "https://www.congreso.es/public_oficiales/L15/CONG/BOCG/A/BOCG-15-A-1-2.PDF",
+      "why": "reserved for the add_document demo"
+    }
+  ],
+  "strategies": {
+    "fixed_200": {
+      "chunks": 398,
+      "mean_words": 199.1,
+      "max_words": 200
+    },
+    "structured": {
+      "chunks": 294,
+      "mean_words": 243.2,
+      "max_words": 400
+    }
+  }
+}
