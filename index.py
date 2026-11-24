@@ -154,6 +154,7 @@ RUNNING_HEAD = re.compile(
     r"^(?:Serie\s+\w+\s+)?Núm\.\s*[\w-]+\s+(?P<fecha>\d{1,2}\s+de\s+\w+\s+de\s+\d{4})\s+Pág\.\s*\d+\s*$"
 )
 CVE_LINE = re.compile(r"^cve:\s*(?P<cve>[\w-]+)\s*$", re.IGNORECASE)
+DOT_LEADER = re.compile(r"\.{3,}\s*\d*\s*$")   # índice / sumario entries
 HYPHEN_BREAK = re.compile(r"(\w)-\s*\n\s*(\w)")
 
 MESES = {
@@ -187,6 +188,7 @@ class Document:
     fecha: str
     cve: str
     pages: list[Page]
+    front_matter: str = ""     # portada + sumario: skipped by the index, read for metadata
     content_sha256: str = ""
 
     @property
@@ -225,9 +227,14 @@ def clean_page(raw: str) -> tuple[list[str], str | None, str | None]:
         if stamp:
             cve = cve or stamp.group("cve")
             continue
+        if DOT_LEADER.search(stripped):
+            continue        # an índice entry, not body text
         kept.append(stripped)
 
-    # Join soft wraps: a line that does not end a sentence continues the next one.
+    # Join soft wraps, but never across a structural heading. Legal texts are full
+    # of short heading lines ("CAPÍTULO I", "Artículo primero.") that do not end in
+    # sentence punctuation, so a naive join swallows them into the paragraph before
+    # and silently destroys the article boundaries the structured chunker needs.
     paragraphs: list[str] = []
     buffer = ""
     for line in kept:
@@ -236,6 +243,9 @@ def clean_page(raw: str) -> tuple[list[str], str | None, str | None]:
                 paragraphs.append(buffer.strip())
                 buffer = ""
             continue
+        if buffer and STRUCTURAL_START.match(line):
+            paragraphs.append(buffer.strip())
+            buffer = ""
         buffer = f"{buffer} {line}".strip() if buffer else line
         if re.search(r"[.:;!?»]$", line):
             paragraphs.append(buffer.strip())
@@ -253,10 +263,13 @@ def load_document(source: Source, path: Path | None = None) -> Document:
     pages: list[Page] = []
     fecha = cve = None
 
+    front: list[str] = []
     for position, page in enumerate(reader.pages, start=1):
         paragraphs, page_fecha, page_cve = clean_page(page.extract_text() or "")
         fecha = fecha or page_fecha
         cve = cve or page_cve
+        if position <= 3:
+            front.extend(paragraphs)
         if _wanted(position, source.pages) and paragraphs:
             pages.append(Page(position, paragraphs))
 
@@ -269,6 +282,7 @@ def load_document(source: Source, path: Path | None = None) -> Document:
         fecha=fecha or "",
         cve=cve or source.doc_id,
         pages=pages,
+        front_matter=" ".join(front),
     )
     body = "\n".join(p for page in pages for p in page.paragraphs)
     document.content_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
@@ -286,13 +300,79 @@ ORDINALES = (
 )
 # The enacted text names articles with Spanish ordinals, not digits:
 # "Artículo primero", not "Artículo 1". A ^Artículo \d regex matches nothing.
-ARTICULO = re.compile(rf"^(Artículo\s+(?:{ORDINALES}|\d+)\b.*)", re.IGNORECASE)
-DISPOSICION = re.compile(
-    r"^(Disposición\s+(?:adicional|transitoria|derogatoria|final)\b.*)", re.IGNORECASE
-)
+ARTICULO = re.compile(rf"^(Artículo\s+(?:{ORDINALES}|\d+)\b.*)")
+DISPOSICION = re.compile(r"^(Disposición\s+(?:adicional|transitoria|derogatoria|final)\b.*)")
 PREAMBULO = re.compile(r"^(PREÁMBULO|EXPOSICIÓN DE MOTIVOS|ÍNDICE)\s*$", re.IGNORECASE)
 ENMIENDA = re.compile(r"^(ENMIENDA\s+NÚM\.\s*\d+)", re.IGNORECASE)
 INTERVENCION = re.compile(r"^((?:El señor|La señora)\s+[A-ZÁÉÍÓÚÑÜ][^:]{0,80}):")
+CAPITULO = re.compile(r"^((?:CAPÍTULO|TÍTULO|SECCIÓN)\s+[IVXLC]+\b.*)")
+
+# Used by clean_page to stop a soft-wrap join from swallowing a heading.
+STRUCTURAL_START = re.compile(
+    "|".join(pattern.pattern for pattern in (ARTICULO, DISPOSICION, PREAMBULO, ENMIENDA, INTERVENCION, CAPITULO))
+)
+MIN_UNIT_WORDS = 25   # a bare "CAPÍTULO I" line is a label, not a chunk of its own
+
+# Parliamentary groups, as they are written in this legislature's own documents.
+# Listed because the group name is not delimited by punctuation in the enmiendas
+# ("...Grupo Parlamentario VOX Enmienda a la totalidad..."), so a purely positional
+# regex runs on into the next sentence. Unknown names fall back to the shape rule.
+GRUPOS_CONOCIDOS = (
+    "Popular en el Congreso", "Plurinacional SUMAR", "Junts per Catalunya",
+    "Euskal Herria Bildu", "Vasco (EAJ-PNV)", "Confederal de Unidas Podemos",
+    "Republicano", "Socialista", "Mixto", "VOX",
+)
+GRUPO_PREFIJO = re.compile(r"Grupo Parlamentario\s+")
+GRUPO_FORMA = re.compile(
+    r"((?:[A-ZÁÉÍÓÚÑ]\S*)(?:\s+(?:de|del|en|el|la|per|y|[A-ZÁÉÍÓÚÑ]\S*)){0,3})"
+)
+# Length-preserving fold, so offsets into the folded text still index the original.
+_ACENTOS = str.maketrans("ÁÀÄÂÉÈËÊÍÌÏÎÓÒÖÔÚÙÜÛÑÇ", "AAAAEEEEIIIIOOOOUUUUNC")
+
+
+def _fold(text: str) -> str:
+    return text.upper().translate(_ACENTOS)
+
+
+def grupos_en(text: str) -> list[str]:
+    """Every parliamentary group named in this text, in order, de-duplicated."""
+    found: list[str] = []
+    for match in GRUPO_PREFIJO.finditer(text):
+        tail = text[match.end():match.end() + 60]
+        name = next((g for g in GRUPOS_CONOCIDOS if tail.startswith(g)), None)
+        if name is None:
+            shape = GRUPO_FORMA.match(tail)
+            name = re.sub(r"[\s.,;:]+$", "", shape.group(1)) if shape else ""
+        if name:
+            found.append(name)
+    return list(dict.fromkeys(found))
+
+
+def grupo_del_interviniente(label: str, sumario: str) -> str:
+    """The group a speaker belongs to, from the session's own sumario.
+
+    The Diario de Sesiones never prints the group on the speech itself; it is only
+    in the sumario, on the pages the index skips. The sumario lists speakers then
+    their group ("... el señor Rego Candamil y la señora Belarra Urteaga, del Grupo
+    Parlamentario Mixto"), so the first group named after a speaker is theirs.
+    """
+    upper = _fold(label)
+    if "PRESIDENT" in upper:
+        return "(presidencia)"
+    if "MINISTR" in upper:
+        return "(Gobierno, sin grupo)"
+    surname = re.sub(r"^(El señor|La señora)\s+", "", label).strip()
+    if not surname or not sumario:
+        return ""
+    folded_sumario, folded_surname = _fold(sumario), _fold(surname)
+    position = folded_sumario.find(folded_surname)
+    if position < 0:                       # try the first surname on its own
+        first = folded_surname.split()[0] if folded_surname.split() else ""
+        position = folded_sumario.find(first) if first else -1
+    if position < 0:
+        return ""
+    grupos = grupos_en(sumario[position:])
+    return grupos[0] if grupos else ""
 
 
 @dataclass
@@ -312,7 +392,7 @@ class Chunk:
 def _heading(paragraph: str, genero: str) -> str | None:
     """The structural label this paragraph starts, if it starts one."""
     if genero == "norma":
-        for pattern in (ARTICULO, DISPOSICION, PREAMBULO):
+        for pattern in (ARTICULO, DISPOSICION, PREAMBULO, CAPITULO):
             match = pattern.match(paragraph)
             if match:
                 return re.sub(r"\s+", " ", match.group(1))[:90].rstrip(". ")
@@ -327,6 +407,28 @@ def _heading(paragraph: str, genero: str) -> str | None:
     return None
 
 
+SHORT_LABEL = re.compile(
+    rf"^(Artículo\s+(?:{ORDINALES}|\d+)\b"
+    r"|Disposición\s+(?:adicional|transitoria|derogatoria|final)\s+\S+"
+    r"|CAPÍTULO\s+[IVXLC]+|TÍTULO\s+[IVXLC]+|SECCIÓN\s+[IVXLC]+"
+    r"|ENMIENDA\s+NÚM\.\s*\d+)"
+)
+
+
+def _short_label(heading: str, genero: str) -> str:
+    """A citation-sized label: 'Artículo primero', not the whole 90-character heading.
+
+    This is what eval/questions.csv puts in expected_location, so it has to be
+    short, stable and easy to write by hand.
+    """
+    if not heading:
+        return "preámbulo"
+    if genero == "debate":
+        return heading
+    match = SHORT_LABEL.match(heading)
+    return match.group(1).rstrip(". ") if match else heading[:60].rstrip(". ")
+
+
 def _base_metadata(document: Document, strategy: str) -> dict:
     return {
         "doc_id": document.doc_id,
@@ -338,6 +440,11 @@ def _base_metadata(document: Document, strategy: str) -> dict:
         "url": document.url,
         "expediente": "121/000001",
         "chunk_strategy": strategy,
+        # Carried on every chunk so add_document can tell an identical re-add from a
+        # revised edition without re-reading the whole document out of the index.
+        "content_sha256": document.content_sha256,
+        "superseded": False,
+        "grupo": "",
     }
 
 
@@ -385,42 +492,79 @@ def chunk_fixed(document: Document, size: int = FIXED_SIZE, overlap: int = FIXED
 
 
 def chunk_structured(document: Document) -> list[Chunk]:
-    """Structure-aware: one chunk per artículo, per enmienda, or per speaker turn."""
-    units: list[tuple[str, int, list[str]]] = []   # (heading, first page, paragraphs)
-    heading, page_of_unit, buffer = "", None, []
+    """Structure-aware: one chunk per artículo, per enmienda, or per speaker turn.
+
+    Paragraphs are carried with their page number all the way through, so that a
+    long section split into several chunks cites the page each piece really came
+    from. A citation a reader cannot verify is worse than no citation.
+    """
+    units: list[tuple[str, list[tuple[int, str]]]] = []
+    heading, buffer = "", []
 
     for page in document.pages:
         for paragraph in page.paragraphs:
             found = _heading(paragraph, document.genero)
             if found:
                 if buffer:
-                    units.append((heading, page_of_unit or page.number, buffer))
-                heading, page_of_unit, buffer = found, page.number, [paragraph]
+                    units.append((heading, buffer))
+                heading, buffer = found, [(page.number, paragraph)]
             else:
-                if page_of_unit is None:
-                    page_of_unit = page.number
-                buffer.append(paragraph)
+                buffer.append((page.number, paragraph))
     if buffer:
-        units.append((heading, page_of_unit or 1, buffer))
+        units.append((heading, buffer))
+
+    # "CAPÍTULO I" sits alone on its line above the article it introduces. Fold such
+    # stubs into the next unit so they become context instead of a one-line chunk.
+    # Debates are left alone: a short "La señora PRESIDENTA: ..." is still a turn,
+    # and merging it would misattribute it to the next speaker.
+    if document.genero == "norma":
+        folded: list[tuple[str, list[tuple[int, str]]]] = []
+        carry: list[tuple[int, str]] = []
+        for unit_heading, pairs in units:
+            if sum(len(text.split()) for _, text in pairs) < MIN_UNIT_WORDS:
+                carry.extend(pairs)
+                continue
+            folded.append((unit_heading, carry + pairs))
+            carry = []
+        if carry:
+            if folded:
+                folded[-1] = (folded[-1][0], folded[-1][1] + carry)
+            else:
+                folded.append(("", carry))
+        units = folded
 
     chunks: list[Chunk] = []
-    for unit_heading, page_number, paragraphs in units:
-        words = " ".join(paragraphs).split()
+    for unit_heading, pairs in units:
+        words: list[tuple[str, int]] = [
+            (word, page_number) for page_number, text in pairs for word in text.split()
+        ]
         if not words:
             continue
-        for part, piece in enumerate(_split_long(words, MAX_STRUCTURED_WORDS, STRUCTURED_OVERLAP)):
-            label = unit_heading or "preámbulo"
-            suffix = f" ({part + 1})" if part else ""
-            interviniente = unit_heading if document.genero == "debate" else ""
+        # The group is a property of the whole unit, so it must be resolved before
+        # the unit is split: only the first piece carries the heading that names it.
+        if document.genero == "debate":
+            grupo = grupo_del_interviniente(unit_heading, document.front_matter)
+        elif document.genero == "enmiendas":
+            grupo = "; ".join(grupos_en(" ".join(text for _, text in pairs[:1])))
+        else:
+            grupo = ""
+        pieces = _split_long(words, MAX_STRUCTURED_WORDS, STRUCTURED_OVERLAP)
+        for part, piece in enumerate(pieces):
+            page_from, page_to = piece[0][1], piece[-1][1]
+            label = _short_label(unit_heading, document.genero)
+            suffix = f" ({part + 1}/{len(pieces)})" if len(pieces) > 1 else ""
+            pages = f"p. {page_from}" + (f"-{page_to}" if page_to != page_from else "")
             metadata = _base_metadata(document, "structured") | {
                 "ordinal": len(chunks),
-                "page": page_number,
-                "page_to": page_number,
+                "page": page_from,
+                "page_to": page_to,
+                "grupo": grupo,
                 "seccion": label,
-                "interviniente": interviniente,
-                "location_label": f"{document.doc_id} · {label}{suffix} · p. {page_number}",
+                "seccion_titulo": unit_heading or "",
+                "interviniente": unit_heading if document.genero == "debate" else "",
+                "location_label": f"{document.doc_id} · {label}{suffix} · {pages}",
             }
-            chunks.append(Chunk(" ".join(piece), metadata))
+            chunks.append(Chunk(" ".join(word for word, _ in piece), metadata))
     return chunks
 
 
@@ -599,10 +743,6 @@ def build(dry_run: bool = False, strategies: tuple[str, ...] = STRATEGIES) -> di
     all_chunks: list[Chunk] = []
     for strategy in strategies:
         chunks = [c for d in documents for c in chunk_document(d, strategy)]
-        for chunk in chunks:
-            chunk.metadata["content_sha256"] = next(
-                d.content_sha256 for d in documents if d.doc_id == chunk.metadata["doc_id"]
-            )
         lengths = [len(c.text.split()) for c in chunks]
         manifest["strategies"][strategy] = {
             "chunks": len(chunks),

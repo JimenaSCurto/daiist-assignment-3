@@ -271,6 +271,76 @@ Rules that follow from it:
 
 ---
 
+### As built (22 Nov 2026, `index.py`, dry run — no embeddings spent)
+
+| | |
+|---|---|
+| Documents | 4 (`BOCG-15-A-1-1`, `-1-4`, `-1-8`, `DSCD-15-PL-54` pp. 4-20 + 32-39) |
+| Words | **63,434** |
+| `fixed_200` | 398 chunks, mean 199 words |
+| `structured` | 309 chunks, mean 228 words, max 400 |
+| Cold build | **707 embeddings** — one day's quota, ~290 spare |
+
+Chunk sizes are 200/40 and 400/60, not the 150/30 sketched above: 150-word chunks
+pushed the cold build over the daily cap.
+
+**The extraction problem to write up in REPORT.md.** Paragraph reassembly joined
+soft-wrapped lines until one ended in sentence punctuation. Legal texts are full of
+heading lines that end in no punctuation at all (`CAPÍTULO I`, and article headings
+that wrap), so headings were being absorbed into the preceding paragraph. The effect
+was invisible in the word counts and severe in the chunking: **only 5 of 18 articles
+in the enacted text were detected**, and the one silently lost was *Artículo primero*
+— the LOREG amendment, the single most important provision in the corpus. Fixed by
+flushing the paragraph buffer at any structural heading before joining.
+
+Two smaller bugs worth a sentence each: `Artículo decimotercero` matched an earlier
+alternative in the ordinals regex and collapsed to `Artículo decimo`, merging six
+articles into one label (missing `\b`); and sub-split chunks all cited the first page
+of their section rather than the page the text was actually on, which would have made
+citations unverifiable against the CVE.
+
+**A finding the corpus hands you for free:** articles per stage — **proyecto 11 →
+informe de la ponencia 12 → aprobación definitiva 18**. Seven articles entered the law
+after the Government's bill. That is the version-drift thesis of the whole project,
+measurable in one line, and a ready-made source of `multi` questions.
+
+---
+
+### `grupo` metadata (added after the first build, before any embedding)
+
+Every chunk now carries the parliamentary group behind it, and `search` takes it as a filter.
+It cost nothing: it was added before the index was embedded.
+
+Two sources, because the two genres record it differently:
+
+- **Debate.** The Diario de Sesiones never prints the group on the speech itself — it is only
+  in the **sumario** (pp. 2-3), which the page filter skips. `load_document` now keeps those
+  pages as `front_matter`, and the group is resolved by finding the speaker's surname and
+  taking the first group named after it, which is how the sumario is written
+  ("...el señor Rego Candamil y la señora Belarra Urteaga, del Grupo Parlamentario Mixto").
+  **14/14 speakers resolved**, with `(presidencia)` and `(Gobierno, sin grupo)` as special
+  cases — the Minister for Equality has no group, and a naive forward search assigns her one
+  from the next agenda item.
+- **Enmiendas.** The group follows the heading inline and is *not* delimited by punctuation
+  ("...Grupo Parlamentario VOX Enmienda a la totalidad..."), so a positional regex runs on into
+  the next sentence. Resolved with a corpus-derived list of group names plus a shape-based
+  fallback. **110/110 amendments resolved**, including the **23 signed jointly** by Socialista
+  and Plurinacional SUMAR, stored as `"Socialista; Plurinacional SUMAR"`.
+
+The group is resolved at *unit* level before a long section is split, because only the first
+piece carries the heading that names it.
+
+**Why it is worth having.** It gives the metadata-filter design something to do on the debate
+side as well as the legal texts, and it makes attribution questions answerable as filters rather
+than as free-text search: *¿qué enmiendas presentó VOX?*, *¿qué argumentó el Grupo Popular?*
+Chroma has no substring match, so `search(grupo=...)` expands a group name to every stored value
+containing it, which is how a jointly signed amendment still matches either signatory.
+
+Counts by group, for reference: Republicano 29, Mixto 24, Socialista+SUMAR 23, Popular 14,
+Junts 9, EAJ-PNV 5, SUMAR 3, Socialista 2, VOX 1.
+
+---
+
 ## 4. Test set
 
 **36 questions: 20 `single`, 10 `multi`, 6 `unanswerable`.** Written from the documents
@@ -310,6 +380,37 @@ and they double as the test cases for the neutrality guardrail.
   (`BOCG-15-A-27-1`), not prose — otherwise hit-rate scoring becomes a manual job.
 - Note: `check.py` calls your search tool with the **first non-unanswerable question** in the
   file, so make `q01` a clean, clearly answerable one.
+
+---
+
+### Worksheet (`eval/worksheet.md`, `eval/sections.csv`) — a tool, not the test set
+
+Generated from the built chunks. It inventories the corpus so that `expected_source` and
+`expected_location` can be copied exactly; the questions, their `kind` and every
+`reference_answer` stay yours, as the brief requires.
+
+`sections.csv` lists all **107 sections** with doc_id, trámite, exact `seccion` label, page
+span, chunk count and word count. `worksheet.md` adds what cannot be read off a list:
+
+- **A cross-stage presence table.** 16 sections exist in all three stages — the natural home for
+  version traps and `multi` questions — and 21 appear only in the final text.
+- **Which sections changed most, bill → enacted text.** `Disposición final primera` 49 → 601
+  words, **`Artículo primero` 207 → 664** (the LOREG amendment more than tripled),
+  `Disposición final tercera` 53 → 508. These are where a retriever without a `tramite` filter
+  will be most confidently wrong, so they make the sharpest traps.
+- **A labelling quirk worth knowing before writing questions:** the Informe de la Ponencia names
+  provisions it proposes as `Disposición adicional (nueva)`, `Disposición final (primera)` — in
+  parentheses — so its labels do *not* align with the other two stages. Write stage comparisons
+  across proyecto ↔ aprobación definitiva, where they match exactly.
+- **The debate's 14 speakers with their parliamentary groups**, recovered from the session's own
+  sumario (pp. 2-3), which the index skips. Useful for attribution questions, and a candidate
+  for a `grupo` metadata field later.
+- A suggested shape for 36 questions as *counts per family*, and guidance that the six
+  unanswerable ones should be near-misses: the enmiendas, the Senado, another bill, anything
+  after July 2024, plus two aimed at the scope guard rather than at retrieval.
+
+Verified against `check.py`: 30+ questions, 5+ `unanswerable`, 5+ `multi`, unique ids,
+`unanswerable` rows with an empty `expected_source`, and 20+ human labels.
 
 ---
 
@@ -385,6 +486,33 @@ anything on stdout corrupts the MCP protocol and `check.py` will fail you for it
 
 ---
 
+### As built (`server.py`, tested over stdio)
+
+Tools exposed: `search(query, tramite="", genero="", k=5)` and `add_document(path)`.
+Probed with an MCP client that mirrors `check.py`'s discovery — it finds `search`
+by its required string `query` and `add_document` by its required string `path`,
+and neither description starts with `TODO`.
+
+- **Tool descriptions carry the corpus boundary.** `search`'s docstring names the four
+  documents and then says what is *not* covered — Senado, other bills, autonomic
+  parliaments, the enmiendas, anything after July 2024. This is the cheapest
+  refusal-behaviour win available, because the model reads it before every call.
+- **Graceful degradation.** With an empty index, `search` returns a plain instruction
+  to run `main.py index` instead of erroring, so `check.py`'s "search returns
+  non-empty text" step passes at every stage of the build.
+- **`add_document` guards, all verified:** non-PDF rejected, paths outside the project
+  rejected, missing file reported, and a real PDF chunks correctly and fails cleanly
+  on the missing API key rather than crashing the server.
+- **Duplicate policy implemented as planned:** identical content is a no-op costing
+  zero embeddings; revised content is indexed as a new edition with the previous
+  chunks marked `superseded` rather than deleted, because comparing versions is the
+  point of this corpus.
+- **The held-back document is ready:** `BOCG-15-A-1-2` chunks into **110 distinct
+  enmiendas** across 209 chunks, so the add-document demo will cost ~209 embeddings.
+- `ACTIVE_STRATEGY` is a module constant, to be set from the retrieval evaluation.
+
+---
+
 ## 7. Agents
 
 ### Subagent — `.claude/agents/corpus-researcher.md`
@@ -440,6 +568,43 @@ The template requires a reason per rule. Proposed set:
 
 ---
 
+### As built (`agent.py` + `AGENTS.md` + the subagent)
+
+`AGENTS.md` holds eight rules, each with its reason, and is loaded from the file as the
+system prompt rather than inlined. Rules 2, 3 and 7 are justified from the corpus licence
+conditions (c)/(d), (a) and (b) respectively — the point made in § 2.
+
+Four guardrails, in the order they fire:
+
+1. **Scope guard** — refuses predictions, verdicts and motive-hunting *before* retrieving,
+   so an out-of-scope question costs zero tokens. Tuned for **precision, not recall**: a
+   false refusal is itself a failure category, so the patterns deliberately leave ordinary
+   "why" questions alone. Measured on a 13-question probe: **6/6 refused, 0/7 false
+   positives**. "¿Cuándo entrará en vigor?" and "¿Se aplicará en las elecciones de 2027?"
+   both pass through, because the disposiciones answer them.
+2. **Call limit** — `MAX_TOOL_CALLS = 6`, enforced in the tool wrapper rather than only via
+   `recursion_limit`, so the model is told to answer with what it has.
+3. **Approval** — `add_document` never runs without a typed yes, and is **denied by default
+   when stdin is not a TTY**, so it can never hang `check.py` or CI.
+4. **Citation check** — any citation naming a `doc_id` that was never retrieved in that
+   session replaces the whole answer with a refusal. `--no-citation-check` disables it, so
+   the evaluation can report the unsupported-claim rate with and without it. That ablation
+   is worth a paragraph in REPORT.md.
+
+`answer()` returns answer, citations, fabricated citations, tool trace, retrieved doc_ids,
+which guardrail fired, token counts and wall time — everything § 8 and § 9 need, including
+the per-question cost.
+
+**Verified end to end without an API key:** `main.py ask "¿Fue una buena ley?"` exits 0 and
+prints the refusal, because the scope guard fires before the key is ever loaded. The
+retrieval path still cannot be tested until the index is embedded.
+
+`CHAT_MODEL` defaults to `gemini-2.5-flash` and is overridable with `GEMINI_CHAT_MODEL`;
+`agent.py --list-models` prints what the key can actually see, since the id could not be
+verified without one.
+
+---
+
 ## 8. Evaluation
 
 `evaluate.py` writes into `eval/`, all committed:
@@ -481,6 +646,49 @@ it to the relevant agenda item like the others, or it will cost you a few hundre
 
 ---
 
+### As built (`evaluate.py`)
+
+Seven stages, all writing into `eval/`: retrieval, agent answers, code checks, LLM judge,
+agreement, failures, cost. Answers and verdicts are **cached by question text**, so re-running
+`main.py evaluate` costs nothing until a question changes; `--refresh` forces a re-run.
+
+**Four designs, two paid for.** `fixed_200` and `structured` are the two indexes; the other
+two ride on the winner for free — a `tramite` metadata filter inferred from the question, and
+a hybrid of dense retrieval with BM25 fused by Reciprocal Rank Fusion. BM25 is implemented in
+~25 lines against numpy rather than adding `rank-bm25`, so there is no new dependency and the
+scoring is yours to explain.
+
+**Strict and lenient multi-passage hit rates are both reported.** A `multi` question counts as
+a strict hit only when *every* expected passage is in the top-k, and as a lenient hit when any
+one is. Most submissions report only the lenient number; the gap between the two is the
+interesting result.
+
+**A free diagnostic:** mean top-1 similarity for answerable vs unanswerable questions, printed
+with the margin. That is the evidence for whether a similarity floor would work as a refusal
+mechanism, and it costs nothing beyond the query embeddings already spent.
+
+**The judge** scores three binary dimensions — `correct`, `supported`, `stage_correct` — from
+the question, your reference answer, the retrieved text as evidence, and the agent's answer,
+and is told to return 0 when uncertain. Agreement reports raw agreement **and Cohen's kappa**
+per dimension against `eval/human_labels.csv`.
+
+**Failures are auto-classified** into the brief's five causes plus `stage_confusion`, with a
+documented precedence and an empty `causa_final` column for your own call. Code decides what
+code can decide: for an `unanswerable` question a refusal is correct with no judge involved.
+
+**The add-document demo is a separate one-shot stage** (`--stage demo`), because adding the
+document destroys the "before" state and spends ~209 embeddings. A full run that finds no
+`eval/before_after.md` prints an INCOMPLETE banner naming what has not been run.
+
+**Tested without an API key.** Unit: BM25 ranking, RRF fusion, strict/lenient hit logic,
+trámite inference (4/4), Cohen's kappa (1.0 identical, 0.0 chance). Integration: the whole
+retrieval stage against the **real 707 chunks** with synthetic vectors in a throwaway index,
+with gold passages planted — produced all four designs, `hit@1 = 0.667` exactly as predicted,
+`multi` strict@1 = 0.0 against lenient@1 = 1.0, and a correct similarity margin. The project's
+own `index/` and `eval/` were untouched.
+
+---
+
 ## 9. Failures and decision
 
 Classify **every** failure into the brief's five buckets — retrieval miss / wrong answer from the
@@ -517,6 +725,37 @@ Fill every heading already in `REPORT.md`. Non-obvious things to make sure you i
 - the AI-use disclosure — be specific about what was generated and what was yours. The brief
   requires that the use case, chunking decision, design choice, refusal policy, judge rubric,
   ship decision, test set, your own grades and the analysis are **yours**.
+
+---
+
+### As drafted (`REPORT.md`)
+
+Every heading from the template is filled or explicitly marked. The split is deliberate:
+
+**Written, because it describes what the code does and can be checked against it:** the corpus
+table with doc_ids, trámites, dates, CVEs and word counts; the licence conditions and the three
+design decisions that follow from them; the ingestion pipeline, the extraction bug and the two
+smaller defects; chunk metadata and counts; the embedding budget; the four retrieval designs and
+what each tests; both tool descriptions and the subagent's instructions; the duplicate policy and
+why superseded chunks are kept rather than deleted; all four guardrails with the scope guard's
+measured precision; the code checks and the judge's three-dimension rubric.
+
+**Left as 11 marked placeholders, because the numbers do not exist yet or the judgement must be
+yours:** the use-case argument in your own words, the test set, every retrieval and evaluation
+result, the guardrail firing, the before/after, the failure cross-tab, and the ship decision.
+Each placeholder says specifically what to put there rather than just "TODO" — including the
+traps: grade your 20+ answers *before* reading the judge's verdicts and say so; `bad_question`
+should not be zero; report a negative retrieval result honestly if that is what you get.
+
+**The AI-use disclosure is drafted but must be checked**, since it is a statement about your
+process. It names what was delegated (the code, the bill investigation, the worksheet) and what
+was not (use case, corpus shape, chunking, design choice, refusal policy, judge rubric, test
+set, human grades, analysis, ship decision).
+
+Every figure was cross-checked against `index/manifest.json` and `eval/sections.csv` rather than
+written from memory. Two errors were caught that way: the baseline chunker was described as
+150/30 when the code uses 200/40, and an ordered list of AGENTS.md rules would have silently
+renumbered 1/2/4/5 into 1/2/3/4, breaking the mapping to the actual file.
 
 ---
 
