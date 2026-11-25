@@ -72,8 +72,8 @@
     {
       "dimension": "correct",
       "n": 32,
-      "acuerdo": 0.969,
-      "kappa": 0.84
+      "acuerdo": 1.0,
+      "kappa": 1.0
     },
     {
       "dimension": "supported",
