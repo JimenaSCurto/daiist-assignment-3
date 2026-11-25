@@ -573,7 +573,6 @@ The grading was also assisted. I made every call in `eval/human_labels.csv`, but
 
 In a final pass, Claude checked each section of this report against the repository, corrected figures that did not match the files (including the q26 label and the recomputed agreement, the citation totals, and averages that had been reported as medians), and rewrote the prose for clarity. I reviewed and accepted the changes.
 
-What I did not delegate was the choice of use case and corpus, the decision to index one bill's full lifecycle instead of several unrelated bills, the refusal policy in `AGENTS.md`, the rejection and replacement of the four weak test questions, the verdicts in `eval/human_labels.csv` and the rules behind them, and the decision above.
 ---
 
 ## AI use
