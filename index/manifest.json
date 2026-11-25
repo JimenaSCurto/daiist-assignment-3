@@ -48,16 +48,21 @@
       "url": "https://www.congreso.es/public_oficiales/L15/CONG/DS/PL/DSCD-15-PL-54.PDF",
       "words": 16855,
       "content_sha256": "7efbcc32eae24fb62f5ffaf7e037fd7b7dccab67628b3b4ac19dd33a69694ef7"
-    }
-  ],
-  "held_back": [
+    },
     {
       "doc_id": "BOCG-15-A-1-2",
       "titulo": "Enmiendas e índice de enmiendas al articulado",
+      "tramite": "enmiendas",
+      "genero": "enmiendas",
+      "fecha": "2024-05-07",
+      "cve": "BOCG-15-A-1-2",
       "url": "https://www.congreso.es/public_oficiales/L15/CONG/BOCG/A/BOCG-15-A-1-2.PDF",
-      "why": "reserved for the add_document demo"
+      "words": 58146,
+      "content_sha256": "de1aa35dfeb7ddba9f204d7727826ea6a0461f1d615d46925ffc47833eafefde",
+      "added_by": "add_document"
     }
   ],
+  "held_back": [],
   "strategies": {
     "fixed_200": {
       "chunks": 398,

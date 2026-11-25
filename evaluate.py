@@ -25,6 +25,7 @@ import json
 import math
 import re
 import sys
+import time
 import unicodedata
 from collections import Counter
 from pathlib import Path
@@ -48,6 +49,7 @@ DEMO_DOCUMENT = ROOT / "corpus" / "BOCG-15-A-1-2.PDF"
 DEMO_QUESTION_ID = ""   # blank = the first unanswerable question in questions.csv
 
 JUDGE_MODEL_ENV = "GEMINI_JUDGE_MODEL"
+JUDGE_MAX_RETRIES = 4       # the free tier returns 503 under load; a blank verdict is not a result
 REFUSAL = "NO CONSTA EN EL CORPUS"
 
 # Keyword -> trámite, for the metadata-filter design. A deliberately simple heuristic:
@@ -179,13 +181,61 @@ def load_strategy(strategy: str) -> dict | None:
     }
 
 
+_SECTION_PAGES: dict[tuple[str, str], set[int]] | None = None
+
+
+def _section_pages() -> dict[tuple[str, str], set[int]]:
+    """(doc_id, seccion) -> the pages that section spans, read from the structured chunks.
+
+    `fixed_200` chunks carry no `seccion`, and their `location_label` is just
+    "doc · p. N", so a section name can never appear in it: scored on the label
+    alone that design is incapable of registering a hit, which made the A/B
+    comparison meaningless rather than merely unfavourable. Page overlap is the
+    unit both designs can satisfy, and it asks the question the hit rate is meant
+    to ask: did retrieval return the passage that holds the answer?
+    """
+    global _SECTION_PAGES
+    if _SECTION_PAGES is None:
+        mapping: dict[tuple[str, str], set[int]] = {}
+        path = ROOT / "index" / "chunks.jsonl"
+        if path.is_file():
+            for line in path.open(encoding="utf-8"):
+                if not line.strip():
+                    continue
+                chunk = json.loads(line)
+                seccion = (chunk.get("seccion") or "").strip().lower()
+                page = chunk.get("page")
+                if not seccion or page is None:
+                    continue
+                page_to = chunk.get("page_to") or page
+                key = (chunk.get("doc_id"), seccion)
+                mapping.setdefault(key, set()).update(range(int(page), int(page_to) + 1))
+        _SECTION_PAGES = mapping
+    return _SECTION_PAGES
+
+
 def is_hit(pairs: list[tuple[str, str]], hits: list[dict], strict: bool) -> bool:
-    """A pair matches when the doc_id matches and the expected location is in the label."""
+    """A pair matches when the doc_id matches and the chunk covers the expected location.
+
+    "Covers" means the section name appears in the label, or - for a chunk with no
+    section label at all - the chunk's pages overlap the expected section's pages.
+    """
+    section_pages = _section_pages()
+
     def matched(source: str, location: str) -> bool:
+        wanted = section_pages.get((source, location.strip().lower()), set())
         for metadata in hits:
             if metadata.get("doc_id") != source:
                 continue
             if not location or location.lower() in (metadata.get("location_label") or "").lower():
+                return True
+            if (metadata.get("seccion") or "").strip() or not wanted:
+                continue
+            page = metadata.get("page")
+            if page is None:
+                continue
+            page_to = metadata.get("page_to") or page
+            if wanted & set(range(int(page), int(page_to) + 1)):
                 return True
         return False
 
@@ -320,7 +370,7 @@ def run_agent(rows: list[dict], refresh: bool, limit: int | None) -> list[dict]:
             "output_tokens": (result.get("tokens") or {}).get("output_tokens", 0),
             "total_tokens": (result.get("tokens") or {}).get("total_tokens", 0),
             "seconds": result.get("seconds", 0),
-            "evidence": evidence[:12000],
+            "evidence": evidence[:40000],
         })
     write_csv(path, results)
     return results
@@ -340,15 +390,40 @@ def code_checks(rows: list[dict], answers: list[dict]) -> list[dict]:
             valid_ids.update(store["ids"])
             valid_labels += [m.get("location_label", "") for m in store["metadatas"]]
     labels = {label.lower() for label in valid_labels}
+    # server.py cites "<location_label> · CVE:<cve>", but the index stores the label
+    # without that suffix, so an exact string test can never resolve a citation.
+    # Split the CVE off, resolve the label, and check the CVE belongs to that chunk.
+    cve_by_label: dict[str, set[str]] = {}
+    for strategy in pipeline.STRATEGIES:
+        store = load_strategy(strategy)
+        if store:
+            for metadata in store["metadatas"]:
+                key = (metadata.get("location_label") or "").lower()
+                cve_by_label.setdefault(key, set()).add((metadata.get("cve") or "").lower())
+
+    def resolves(citation: str) -> bool:
+        text = citation.strip().strip("[]").strip()
+        label, _, cve = text.partition("· CVE:")
+        label = label.strip().lower()
+        if label not in labels:
+            return False
+        cve = cve.strip().lower()
+        return not cve or cve in cve_by_label.get(label, set())
 
     checks: list[dict] = []
     for record in answers:
         row = by_id.get(record["id"], {})
         kind = (row.get("kind") or "").strip().lower()
         citations = [c for c in (record.get("citations") or "").split(" | ") if c.strip()]
-        refused = str(record.get("refused", "0")) == "1"
+        # The agent only flagged a refusal when the fixed phrase OPENED the answer,
+        # so a refusal that explained itself first (q07) was counted as an answer.
+        # The phrase anywhere in the text is a refusal; whether it LEADS is a
+        # separate, reportable thing, because regla 5 requires it to lead.
+        answer_text = str(record.get("answer") or "")
+        refused = str(record.get("refused", "0")) == "1" or REFUSAL in answer_text
+        refusal_leads = answer_text.lstrip().startswith(REFUSAL)
 
-        resolvable = sum(1 for c in citations if c.strip().lower() in labels)
+        resolvable = sum(1 for c in citations if resolves(c))
         cited_docs = set(re.findall(r"\b((?:BOCG|DSCD)-[\w-]+)\b", " ".join(citations)))
         retrieved = set((record.get("retrieved_doc_ids") or "").split())
         invented = sorted(cited_docs - retrieved) if cited_docs else []
@@ -363,6 +438,7 @@ def code_checks(rows: list[dict], answers: list[dict]) -> list[dict]:
             # For an unanswerable question a refusal is simply correct. No judge needed.
             "refusal_correct": int(refused) if kind == "unanswerable" else ("" if not refused else 0),
             "wrong_refusal": int(refused and kind != "unanswerable"),
+            "refusal_leads": int(refusal_leads) if refused else "",
             "citations": len(citations),
             "citations_resolvable": resolvable,
             "citations_unresolvable": len(citations) - resolvable,
@@ -382,17 +458,29 @@ def code_checks(rows: list[dict], answers: list[dict]) -> list[dict]:
 JUDGE_RUBRIC = """Eres un evaluador estricto. Juzgas la respuesta de un asistente que solo
 puede responder citando un expediente parlamentario del Congreso de los Diputados.
 
-Te doy: la pregunta, la respuesta de referencia escrita por una persona, el TEXTO RECUPERADO
-que el asistente tenía delante, y su RESPUESTA.
+Te doy: la pregunta, su TIPO, la respuesta de referencia escrita por una persona, el TEXTO
+RECUPERADO que el asistente tenía delante, y su RESPUESTA.
+
+HECHOS QUE DEBES DAR POR CIERTOS, por encima de tu propio juicio:
+
+- El TIPO es verdad comprobada. Si TIPO es `single` o `multi`, la pregunta SÍ tiene respuesta
+  en el corpus y la respuesta de referencia la contiene. Negarse entonces ("NO CONSTA EN EL
+  CORPUS" o equivalente) es un fallo: correct=0. Solo si TIPO es `unanswerable` la negativa
+  es la respuesta correcta.
+- Un TEXTO RECUPERADO vacío NO significa que el corpus esté vacío ni que la pregunta sea
+  incontestable: significa que el asistente no buscó. Si TIPO es `single` o `multi`, eso es
+  correct=0.
+- Si la RESPUESTA empieza por "ERROR:" es un fallo del sistema, no una respuesta:
+  correct=0, supported=0, stage_correct=0.
 
 Juzga tres dimensiones, cada una 1 o 0. Si dudas, pon 0 y explica por qué.
 
-1. "correct": ¿coincide en lo esencial con la respuesta de referencia? Si la pregunta es
-   incontestable con este corpus, entonces correct=1 SOLO si el asistente se negó a responder
-   (dijo "NO CONSTA EN EL CORPUS" o equivalente). Inventar una respuesta a una pregunta
-   incontestable es correct=0.
-2. "supported": ¿toda afirmación de la respuesta aparece en el TEXTO RECUPERADO? Si afirma algo
-   que no está ahí, aunque sea cierto en el mundo real, supported=0.
+1. "correct": ¿coincide en lo esencial con la respuesta de referencia, respetando los hechos
+   de arriba?
+2. "supported": ¿aparece CADA afirmación en el TEXTO RECUPERADO? Comprueba uno por uno los
+   nombres propios, nombres de pila, fechas, cifras y porcentajes: si la respuesta añade un
+   dato que no está literalmente en el texto —por ejemplo el nombre de pila de una persona
+   cuando el texto solo da el apellido— es supported=0, aunque sea cierto en el mundo real.
 3. "stage_correct": ¿distingue correctamente la fase del trámite? Presentar el texto del
    proyecto del Gobierno como si fuera la ley aprobada es stage_correct=0. Si la respuesta no
    depende de la fase, pon 1.
@@ -412,7 +500,9 @@ def judge(rows: list[dict], answers: list[dict], refresh: bool) -> list[dict]:
     cached: dict[str, dict] = {}
     if path.is_file() and not refresh:
         with path.open(newline="", encoding="utf-8") as handle:
-            cached = {r["id"]: r for r in csv.DictReader(handle) if r.get("id")}
+            # A verdict with no score is a failed call, not a result: retry it.
+            cached = {r["id"]: r for r in csv.DictReader(handle)
+                      if r.get("id") and str(r.get("correct", "")).strip() != ""}
 
     by_id = {r["id"]: r for r in rows}
     model = os.environ.get(JUDGE_MODEL_ENV) or __import__("agent").CHAT_MODEL
@@ -429,16 +519,24 @@ def judge(rows: list[dict], answers: list[dict], refresh: bool) -> list[dict]:
             f"PREGUNTA: {record['question']}\n\n"
             f"TIPO: {row.get('kind', '')}\n\n"
             f"RESPUESTA DE REFERENCIA: {row.get('reference_answer', '')}\n\n"
-            f"TEXTO RECUPERADO:\n{record.get('evidence', '')[:12000]}\n\n"
+            f"TEXTO RECUPERADO:\n{record.get('evidence', '')[:40000]}\n\n"
             f"RESPUESTA DEL ASISTENTE:\n{record['answer']}"
         )
-        try:
-            response = client.models.generate_content(model=model, contents=prompt)
-            raw = (response.text or "").strip()
-            payload = json.loads(re.search(r"\{.*\}", raw, re.S).group(0))
-        except Exception as error:  # noqa: BLE001 - record it and carry on
-            payload = {"correct": "", "supported": "", "stage_correct": "",
-                       "razon": f"judge failed: {type(error).__name__}: {error}"}
+        payload = None
+        for attempt in range(JUDGE_MAX_RETRIES):
+            try:
+                response = client.models.generate_content(model=model, contents=prompt)
+                raw = (response.text or "").strip()
+                payload = json.loads(re.search(r"\{.*\}", raw, re.S).group(0))
+                break
+            except Exception as error:  # noqa: BLE001 - retry transient load, then record
+                transient = "503" in str(error) or "UNAVAILABLE" in str(error) or "429" in str(error)
+                if transient and attempt < JUDGE_MAX_RETRIES - 1:
+                    time.sleep(5.0 * (attempt + 1))
+                    continue
+                payload = {"correct": "", "supported": "", "stage_correct": "",
+                           "razon": f"judge failed: {type(error).__name__}: {error}"}
+                break
         verdicts.append({"id": record["id"], "kind": record.get("kind", ""), **payload})
         print(f"  [{position}/{len(answers)}] {record['id']} -> {payload.get('correct')}/"
               f"{payload.get('supported')}/{payload.get('stage_correct')}")
@@ -557,7 +655,14 @@ def demo(rows: list[dict]) -> int:
     print(f"  question: {target['question']}")
     before = answer(target["question"], approve=False)
     print("  -- adding the document (this spends embeddings) --")
-    added = answer(f"Añade el documento {DEMO_DOCUMENT.relative_to(ROOT)} al índice.", approve=True)
+    # approve=True pre-authorises the harness gate, but rule 8 of AGENTS.md tells the
+    # model never to call add_document without explicit approval *in the conversation*,
+    # so it asks instead of acting. The approval has to be stated in the turn as well.
+    added = answer(
+        f"Añade el documento {DEMO_DOCUMENT.relative_to(ROOT)} al índice. "
+        f"Apruebo explícitamente esta operación: procede a llamar a add_document.",
+        approve=True,
+    )
     after = answer(target["question"], approve=False)
 
     BEFORE_AFTER.write_text(
@@ -630,6 +735,7 @@ def main() -> int:
         "rechazos": sum(c["refused"] for c in checks),
         "rechazos_correctos": sum(1 for c in checks if c["refusal_correct"] == 1),
         "rechazos_indebidos": sum(c["wrong_refusal"] for c in checks),
+        "rechazos_sin_frase_al_inicio": sum(1 for c in checks if c["refused"] and c["refusal_leads"] == 0),
         "sin_cita": sum(1 for c in checks if not c["has_citation"] and not c["refused"]),
         "citas_no_resolubles": sum(c["citations_unresolvable"] for c in checks),
         "citas_inventadas": sum(c["cited_but_not_retrieved"] for c in checks),

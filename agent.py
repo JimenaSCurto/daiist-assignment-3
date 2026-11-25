@@ -34,8 +34,13 @@ AGENTS_MD = ROOT / "AGENTS.md"
 
 # Override with GEMINI_CHAT_MODEL if this id is wrong for your project;
 # `python agent.py --list-models` prints what your key can actually see.
-CHAT_MODEL = os.environ.get("GEMINI_CHAT_MODEL", "gemini-2.5-flash")
+# gemini-2.5-flash is 404 for keys created recently ("no longer available to new
+# users"), and the full gemini-3.x flash models answer 503 on the free tier. The
+# -latest aliases track whatever is actually being served, and flash-lite is the
+# one the free tier reliably serves. Override with GEMINI_CHAT_MODEL.
+CHAT_MODEL = os.environ.get("GEMINI_CHAT_MODEL", "gemini-flash-lite-latest")
 MAX_TOOL_CALLS = 6
+EVIDENCE_CHARS = 12000      # per tool call, kept for the judge
 REFUSAL = "NO CONSTA EN EL CORPUS"
 
 CITATION = re.compile(r"\[([^\[\]]{5,200})\]")
@@ -113,7 +118,10 @@ class Harness:
     def record(self, name: str, arguments: dict, result: str, seconds: float) -> None:
         self.calls.append(
             {"tool": name, "args": arguments, "seconds": round(seconds, 2),
-             "result_chars": len(result), "result": result[:2000]}
+             # The judge grades "supported" against this text, so it must hold what the
+             # model actually read. At 2000 chars a k=5 search was cut to its first
+             # chunk or two and valid citations were scored unsupported.
+             "result_chars": len(result), "result": result[:EVIDENCE_CHARS]}
         )
 
     # Guardrail 3 -------------------------------------------------------
@@ -262,7 +270,7 @@ async def answer_async(question: str, approve: bool | None = None, validate: boo
         "fabricated_citations": fabricated,
         "retrieved_doc_ids": sorted(harness.retrieved_doc_ids),
         "guardrail": harness.guardrail,
-        "refused": text.startswith(REFUSAL),
+        "refused": REFUSAL in text,
         "tokens": _usage(messages),
         "seconds": round(time.monotonic() - started, 2),
     }

@@ -24,6 +24,7 @@ import hashlib
 import json
 import re
 import sys
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,6 +50,7 @@ BASE_URL = "https://www.congreso.es/public_oficiales/L15/CONG"
 EMBED_MODEL = "gemini-embedding-2"
 EMBED_DIM = 768  # reduced from the default to keep index/ far below the 90 MB cap
 EMBED_BATCH = 16
+EMBED_MAX_RETRIES = 6        # free tier caps embed tokens per minute; back off and retry
 
 STRATEGIES = ("fixed_200", "structured")
 DEFAULT_STRATEGY = "structured"
@@ -625,6 +627,16 @@ def _save_vector_cache(cache: dict[str, np.ndarray]) -> None:
     VECTOR_KEYS_PATH.write_text(json.dumps(keys), encoding="utf-8")
 
 
+def _retry_delay(error: Exception, attempt: int) -> float | None:
+    """Seconds to wait before retrying a rate-limited embed call, or None if fatal."""
+    text = str(error)
+    if "RESOURCE_EXHAUSTED" not in text and "429" not in text:
+        return None
+    match = re.search(r"retry in ([\d.]+)s", text, re.IGNORECASE)
+    suggested = float(match.group(1)) if match else 0.0
+    return max(suggested + 2.0, 5.0 * (attempt + 1))   # honour the server, else back off
+
+
 def _embed_batch(texts: list[str], task_type: str) -> list[np.ndarray]:
     from google import genai
     from google.genai import types
@@ -632,16 +644,35 @@ def _embed_batch(texts: list[str], task_type: str) -> list[np.ndarray]:
     from api_key import load_api_key
 
     client = genai.Client(api_key=load_api_key())
-    response = client.models.embed_content(
-        model=EMBED_MODEL,
-        contents=texts,
-        config=types.EmbedContentConfig(task_type=task_type, output_dimensionality=EMBED_DIM),
-    )
+    # One Content per text. google-genai treats a bare list[str] as the parts of a
+    # SINGLE content and returns one embedding for the whole lot, which silently
+    # drops every text but the first; the length check below makes that loud.
+    contents = [types.Content(parts=[types.Part(text=t)]) for t in texts]
+    response = None
+    for attempt in range(EMBED_MAX_RETRIES):
+        try:
+            response = client.models.embed_content(
+                model=EMBED_MODEL,
+                contents=contents,
+                config=types.EmbedContentConfig(task_type=task_type, output_dimensionality=EMBED_DIM),
+            )
+            break
+        except Exception as error:  # noqa: BLE001 - only rate limits are retried
+            delay = _retry_delay(error, attempt)
+            if delay is None or attempt == EMBED_MAX_RETRIES - 1:
+                raise
+            print(f"    rate limited; waiting {delay:.0f}s", flush=True)
+            time.sleep(delay)
     vectors = []
     for embedding in response.embeddings:
         vector = np.asarray(embedding.values, dtype=np.float32)
         norm = np.linalg.norm(vector)
         vectors.append(vector / norm if norm else vector)   # reduced dimensions need normalising
+    if len(vectors) != len(texts):
+        raise RuntimeError(
+            f"embedding API returned {len(vectors)} vectors for {len(texts)} texts; "
+            f"refusing to zip() them silently."
+        )
     return vectors
 
 
@@ -659,6 +690,69 @@ def embed_texts(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT", log=pri
             _save_vector_cache(cache)   # save as we go: a crash or the daily cap loses nothing
             log(f"    {min(start + EMBED_BATCH, len(missing))}/{len(missing)}")
     return [cache[hashlib.sha256(t.encode("utf-8")).hexdigest()] for t in texts]
+
+
+def _document_words(doc_id: str) -> int | None:
+    """The document's own word count, the way a full build measures it."""
+    source = BY_DOC_ID.get(doc_id)
+    if source is None:
+        return None
+    try:
+        return load_document(source).words
+    except Exception:  # noqa: BLE001 - fall back to the caller's estimate
+        return None
+
+
+def record_added_document(chunks: list["Chunk"], strategy: str) -> dict:
+    """Write an added document into chunks.jsonl and manifest.json.
+
+    embed_and_store() updates Chroma and the vector cache, which is what search reads,
+    but chunks.jsonl and manifest.json were only ever written by a full `main.py index`
+    build. A document added through add_document was therefore invisible in both: the
+    manifest still listed it as `held_back` while 209 of its chunks were being returned
+    by search. Idempotent - re-recording the same document replaces its rows.
+    """
+    if not chunks:
+        return {"recorded": 0}
+    doc_id = chunks[0].metadata["doc_id"]
+
+    existing = []
+    if CHUNKS_PATH.is_file():
+        with CHUNKS_PATH.open(encoding="utf-8") as handle:
+            existing = [json.loads(line) for line in handle if line.strip()]
+    kept = [r for r in existing
+            if not (r.get("doc_id") == doc_id and r.get("chunk_strategy") == strategy)]
+    with CHUNKS_PATH.open("w", encoding="utf-8") as handle:
+        for record in kept:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        for chunk in chunks:
+            handle.write(json.dumps(
+                {"id": chunk.chunk_id, "text": chunk.text, **chunk.metadata},
+                ensure_ascii=False) + "\n")
+
+    if MANIFEST_PATH.is_file():
+        manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+        meta = chunks[0].metadata
+        manifest["held_back"] = [h for h in manifest.get("held_back", [])
+                                 if h.get("doc_id") != doc_id]
+        if not any(d.get("doc_id") == doc_id for d in manifest.get("documents", [])):
+            manifest.setdefault("documents", []).append({
+                "doc_id": doc_id,
+                "titulo": meta.get("titulo", ""),
+                "tramite": meta.get("tramite", ""),
+                "genero": meta.get("genero", ""),
+                "fecha": meta.get("fecha", ""),
+                "cve": meta.get("cve", ""),
+                "url": meta.get("url", ""),
+                # Count words from the document's own text, as a full build does.
+                # Summing chunk words double-counts the overlap between split chunks.
+                "words": _document_words(doc_id) or sum(len(c.text.split()) for c in chunks),
+                "content_sha256": meta.get("content_sha256", ""),
+                "added_by": "add_document",
+            })
+        MANIFEST_PATH.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
+    return {"recorded": len(chunks), "doc_id": doc_id}
 
 
 def _collection(strategy: str):

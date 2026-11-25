@@ -18,6 +18,12 @@ Hard rules `check.py` enforces: 30+ questions; 5+ `unanswerable`; 5+ `multi`; un
 The first non-unanswerable row is the question `check.py` puts through the server and the
 agent, so make `q01` something clean and clearly answerable.
 
+> **Note on the counts below.** The per-document word counts in this worksheet come from an
+> earlier extraction pass and total 70,574. The authoritative figures are in
+> `index/manifest.json` and REPORT.md: **63,434 words across four documents**. The difference is
+> front matter that the final page filter excludes. The section names and `doc_id` values below
+> are still correct and are what `expected_location` was copied from.
+
 ## The corpus
 
 | doc_id | trámite | date | sections | words |

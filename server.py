@@ -193,6 +193,9 @@ def add_document(path: str) -> str:
         status = pipeline.document_status(doc_id, content_hash, ACTIVE_STRATEGY)
 
         if status == "identical":
+            # Still record it: the chunks may be in Chroma while chunks.jsonl and the
+            # manifest have never heard of them.
+            pipeline.record_added_document(chunks, ACTIVE_STRATEGY)
             return (f"{doc_id} ya está indexado con este mismo contenido "
                     f"({len(chunks)} fragmentos). No se ha gastado ningún embedding.")
 
@@ -211,6 +214,7 @@ def add_document(path: str) -> str:
                 superseded = len(stale)
 
         result = pipeline.embed_and_store(chunks, strategy=ACTIVE_STRATEGY, log=log)
+        pipeline.record_added_document(chunks, ACTIVE_STRATEGY)
         note = f" Se han marcado como superados {superseded} fragmentos de la edición anterior." if superseded else ""
         return (f"Indexado {doc_id} ({status}): {result['chunks']} fragmentos, "
                 f"{result['embedded']} embeddings nuevos, índice «{ACTIVE_STRATEGY}».{note}")
