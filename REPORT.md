@@ -563,20 +563,6 @@ If I had to keep one finding from all of this for a future version, it would be 
 
 ## AI use
 
-I used Claude Code (Claude Opus 5.5) throughout the build, and Claude (claude.ai) for a final review of this report. Claude wrote the code in `index.py`, `server.py`, `agent.py` and `evaluate.py`, as well as the rules in `AGENTS.md`.
-
-The test set was written collaboratively. Claude read the corpus and proposed 32 candidate questions, with `expected_source` and `expected_location` already filled in from the chunk metadata. I reviewed the whole set, rejected four vague debate questions and accepted four replacements about the approved text, and accepted the other 28 as proposed. So the questions are mine by selection and revision rather than by authorship.
-
-Claude also found the six bugs described in this report during the evaluation run, and each of them would have falsified a number: the silent embedding-batch truncation, the unscoreable `fixed_200` hit rate, the citation resolver that ignored the CVE suffix, the 2,000-character evidence cap that starved the judge, the demo that never added its document, and the refusal detector that only counted the fixed phrase when it opened the answer. Five of the six were measurement bugs rather than system bugs, and that is probably the main thing this assignment taught me: a RAG evaluation can report very confident numbers that mean nothing. The last one only came up during manual grading, which is itself an argument for grading by hand.
-
-The grading was also assisted. I made every call in `eval/human_labels.csv`, but Claude presented the answers in batches, with its own checks against `index/chunks.jsonl` and a recommended verdict for each one, and I agreed with all 32. One of those verdicts was wrong (q26, `correct=0`) and was corrected after a later check against *Artículo primero*, which is one more reason to read the agreement figures as an upper bound.
-
-In a final pass, Claude checked each section of this report against the repository, corrected figures that did not match the files (including the q26 label and the recomputed agreement, the citation totals, and averages that had been reported as medians), and rewrote the prose for clarity. I reviewed and accepted the changes.
-
----
-
-## AI use
-
 Claude Code (Claude Opus 5.5) was used. Specifically:
 
 **Written by Claude:** the code in `index.py`, `server.py`, `agent.py`, `evaluate.py` and the rules in `AGENTS.md`.
